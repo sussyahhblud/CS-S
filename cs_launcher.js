@@ -32,7 +32,7 @@ if (ENVIRONMENT_IS_NODE) {
 // --pre-jses are emitted after the Module integration code, so that they can
 // refer to Module (if they choose; they can also define Module)
 // include: emscripten/pre.js
-console.log('=== BUILD 23:54:06 ===')
+console.log('=== BUILD 02:41:48 ===')
 Module['arguments'] = Module['arguments'] || []
 Module['arguments'].push(
 	'-game', 'cstrike',
@@ -323,6 +323,9 @@ if(FILES_BASE) {
 // the repo from GitHub, and that clears within minutes; a standalone page
 // should wait it out instead of failing the whole load. 404 is never retried:
 // in the part probing below, a 404 is how the end of a set is found.
+// Split chunk parts downloaded at the same time.
+const PARALLEL_PARTS = 6
+
 const tryFetch = async url => {
 	const delays = [2000, 5000, 10000]
 	for(let attempt = 0; ; attempt++) {
@@ -519,14 +522,32 @@ class DataLoader {
 		if(manifest) {
 			const m = await manifest.json()
 			const first = m.first || 0
+			// Several parts download at once; the parser still takes them in
+			// order, so the ones ahead of it wait in memory (at most
+			// PARALLEL_PARTS parts, ~19 MB each).
+			const fetchPart = index => {
+				const url = partUrl(first + index)
+				return tryFetch(url).then(async response => {
+					if(!response) throw new Error(`cannot load map ${mapName}: part missing ${url}`)
+					return new Response(await response.arrayBuffer())
+				})
+			}
+			const started = []
 			let i = 0
 			return {
 				total: m.size || 0,
 				next: async () => {
 					if(i >= m.parts) return null
-					const url = partUrl(first + i++)
-					const response = await tryFetch(url)
-					if(!response) throw new Error(`cannot load map ${mapName}: part missing ${url}`)
+					for(let j = i; j < Math.min(i + PARALLEL_PARTS, m.parts); j++) {
+						if(!started[j]) {
+							started[j] = fetchPart(j)
+							// awaited later; this only stops an early failure being
+							// reported as unhandled before its turn comes
+							started[j].catch(() => {})
+						}
+					}
+					const response = await started[i]
+					started[i++] = null
 					return response
 				}
 			}
