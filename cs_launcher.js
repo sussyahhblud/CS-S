@@ -32,7 +32,7 @@ if (ENVIRONMENT_IS_NODE) {
 // --pre-jses are emitted after the Module integration code, so that they can
 // refer to Module (if they choose; they can also define Module)
 // include: emscripten/pre.js
-console.log('=== BUILD 23:05:47 ===')
+console.log('=== BUILD 23:54:06 ===')
 Module['arguments'] = Module['arguments'] || []
 Module['arguments'].push(
 	'-game', 'cstrike',
@@ -393,7 +393,14 @@ class DataLoader {
 		return ('common' in this.chunkFiles) && (name in this.chunkFiles)
 	}
 
-	async loadMapWithDeps(mapName) {
+	// keepMapName is the map still being played, if any. The single-threaded
+	// build downloads while the current map keeps running, so that map's files
+	// must survive until the switch has actually happened.
+	async loadMapWithDeps(mapName, keepMapName) {
+		const normalise = n => String(n || '').toLowerCase().replace(/^maps[\\/]/, '').replace(/\.bsp$/, '')
+		mapName = normalise(mapName)
+		keepMapName = normalise(keepMapName)
+
 		if(this.mapsOrdered.indexOf(mapName) === -1) {
 			// The engine probes for maps this build does not ship -- CS:S asks
 			// for background01 whenever startupmenu runs. Warn and carry on;
@@ -411,10 +418,15 @@ class DataLoader {
 		const prev = null
 
 		// Free everything outside the resident set BEFORE fetching, so the peak
-		// stays at the set rather than the set plus whatever is arriving.
+		// stays at the set rather than the set plus whatever is arriving. The
+		// map being played is part of that set: evicting it here is what emptied
+		// cs_office mid-match while the next map downloaded.
+		const keep = new Set(['common', mapName])
+		if(prev) keep.add(prev)
+		if(keepMapName) keep.add(keepMapName)
 		for(const name of Object.keys(this.chunkFiles)) {
-			if(name !== 'common' && name !== mapName && name !== prev) {
-				this.evictMap(name)
+			if(!keep.has(name)) {
+				this.evictMap(name, keep)
 			}
 		}
 
@@ -426,7 +438,7 @@ class DataLoader {
 
 	// Unlink everything a chunk wrote. MEMFS holds file contents as JS arrays,
 	// so dropping the nodes is what actually returns the memory.
-	evictMap(mapName) {
+	evictMap(mapName, keep = new Set(['common'])) {
 		const paths = this.chunkFiles[mapName]
 		if(!paths) return
 
@@ -435,14 +447,18 @@ class DataLoader {
 		// provides, and common is never reloaded -- the file would be missing for
 		// the rest of the session. That is what made decals turn into
 		// checkerboards after a level change.
-		if(!this.commonPathSet) {
-			this.commonPathSet = new Set(this.chunkFiles['common'] || [])
+		// Not only common's paths: any chunk being kept -- the map still in play
+		// -- can share nodes with this one too.
+		const protectedPaths = new Set()
+		for(const name of keep) {
+			if(name === mapName) continue
+			for(const path of this.chunkFiles[name] || []) protectedPaths.add(path)
 		}
 
 		let freed = 0
 		let shared = 0
 		for(const path of paths) {
-			if(this.commonPathSet.has(path)) {
+			if(protectedPaths.has(path)) {
 				shared++
 				continue
 			}
@@ -457,7 +473,7 @@ class DataLoader {
 
 		delete this.chunkFiles[mapName]
 		delete this.loadedMaps[mapName]
-		console.log(`evicted chunk ${mapName}: freed ${freed}/${paths.length} files, kept ${shared} shared with common`)
+		console.log(`evicted chunk ${mapName}: freed ${freed}/${paths.length} files, kept ${shared} still used by ${[...keep].join(', ')}`)
 	}
 
 	async loadMapCached(mapName) {
