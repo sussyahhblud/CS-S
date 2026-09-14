@@ -32,7 +32,7 @@ if (ENVIRONMENT_IS_NODE) {
 // --pre-jses are emitted after the Module integration code, so that they can
 // refer to Module (if they choose; they can also define Module)
 // include: emscripten/pre.js
-console.log('=== BUILD 02:41:48 ===')
+console.log('=== BUILD 03:06:16 ===')
 Module['arguments'] = Module['arguments'] || []
 Module['arguments'].push(
 	'-game', 'cstrike',
@@ -239,6 +239,20 @@ Module.hl2Persist = (() => {
 
 Module['preRun'] = Module['preRun'] || []
 Module['preRun'].push(() => {
+	// Valve's factory shader list: the pairs CS:S draws, recorded by a native run
+	// through every map with bots. The engine compiles them during startup, so
+	// they are not compiled mid-match the first time each one is drawn.
+	addRunDependency('glbaseshaders')
+	tryFetch(`${FILES_BASE}assets/glbaseshaders.cfg`)
+		.then(response => response ? response.arrayBuffer() : null)
+		.then(buffer => {
+			if(!buffer) return console.warn('glbaseshaders.cfg not found - shaders will compile during play')
+			FS.mkdirTree('/cstrike')
+			FS.writeFile('/cstrike/glbaseshaders.cfg', new Uint8Array(buffer))
+		})
+		.catch(e => console.warn('glbaseshaders.cfg failed:', e))
+		.finally(() => removeRunDependency('glbaseshaders'))
+
 	// Mounting can throw outright where IndexedDB is refused -- some browsers do
 	// on file:// -- and a throw here takes the whole game down. Run without
 	// saves instead.
