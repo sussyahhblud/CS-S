@@ -32,11 +32,12 @@ if (ENVIRONMENT_IS_NODE) {
 // --pre-jses are emitted after the Module integration code, so that they can
 // refer to Module (if they choose; they can also define Module)
 // include: emscripten/pre.js
-console.log('=== BUILD 03:06:16 ===')
+console.log('=== BUILD 19:02:44 ===')
 Module['arguments'] = Module['arguments'] || []
 Module['arguments'].push(
 	'-game', 'cstrike',
-	'-noip',
+	// No -noip: it makes NET_SetMutiplayer refuse, so connect could never reach
+	// a server. Local games still use the loopback path.
 	'-language', 'english',
 	// The startup video owns the screen while it plays: SCR_UpdateScreen
 	// returns early every frame until it finishes, so a video that never
@@ -238,10 +239,60 @@ Module.hl2Persist = (() => {
 })()
 
 Module['preRun'] = Module['preRun'] || []
+// Keep running while hidden. The main loop waits on requestAnimationFrame,
+// which stops in background tabs and covered windows -- so a browser-hosted
+// server froze when its window went behind another and nobody could join. Each
+// frame also arms a fallback from a worker timer (not throttled like page
+// timers); whichever fires first runs the frame, so a visible page stays on rAF.
+Module['preRun'] = Module['preRun'] || []
+Module['preRun'].push(() => {
+	if(typeof MainLoop === 'undefined' || typeof Worker === 'undefined' || typeof Blob === 'undefined') return
+	let ticker
+	try {
+		const src = 'onmessage = e => setTimeout(() => postMessage(0), e.data)'
+		ticker = new Worker(URL.createObjectURL(new Blob([src], { type: 'text/javascript' })))
+	} catch(e) {
+		console.warn('background main loop unavailable:', e)
+		return
+	}
+	const waiting = []
+	ticker.onmessage = () => {
+		const run = waiting.shift()
+		if(run) run(performance.now())
+	}
+	const FALLBACK_MS = 25
+	const raf = MainLoop.requestAnimationFrame.bind(MainLoop)
+	MainLoop.requestAnimationFrame = func => {
+		let done = false
+		const run = t => {
+			if(done) return
+			done = true
+			func(t)
+		}
+		raf(run)
+		waiting.push(run)
+		ticker.postMessage(FALLBACK_MS)
+	}
+})
+
 Module['preRun'].push(() => {
 	// Valve's factory shader list: the pairs CS:S draws, recorded by a native run
 	// through every map with bots. The engine compiles them during startup, so
 	// they are not compiled mid-match the first time each one is drawn.
+	// The server browser's layouts (servers/*.res). They live in platform_misc,
+	// which the packer never collected, so they ship as assets instead.
+	addRunDependency('server_browser_files')
+	FS.mkdirTree('/platform/servers')
+	tryFetch(`${FILES_BASE}assets/servers/index.json`)
+		.then(response => response ? response.json() : [])
+		.then(names => Promise.all(names.map(name =>
+			tryFetch(`${FILES_BASE}assets/servers/${name}`)
+				.then(response => response ? response.arrayBuffer() : null)
+				.then(buffer => { if(buffer) FS.writeFile(`/platform/servers/${name}`, new Uint8Array(buffer)) })
+		)))
+		.catch(e => console.warn('server browser files failed:', e))
+		.finally(() => removeRunDependency('server_browser_files'))
+
 	addRunDependency('glbaseshaders')
 	tryFetch(`${FILES_BASE}assets/glbaseshaders.cfg`)
 		.then(response => response ? response.arrayBuffer() : null)
@@ -338,7 +389,8 @@ if(FILES_BASE) {
 // should wait it out instead of failing the whole load. 404 is never retried:
 // in the part probing below, a 404 is how the end of a set is found.
 // Split chunk parts downloaded at the same time.
-const PARALLEL_PARTS = 6
+// 4, not more: each waiting part is ~19 MB held in memory.
+const PARALLEL_PARTS = 4
 
 const tryFetch = async url => {
 	const delays = [2000, 5000, 10000]
@@ -451,6 +503,23 @@ class DataLoader {
 		if(prev) await this.loadMapCached(prev)
 
 		await this.loadMapCached(mapName)
+		this.logMemory(mapName)
+	}
+
+	// One line per map load, so a crash on a low-memory machine leaves numbers
+	// in the console: the game's heap, the unpacked files, and the JS heap
+	// (Chrome only).
+	logMemory(mapName) {
+		const mb = n => Math.round(n / 1048576)
+		let files = 0
+		for(const paths of Object.values(this.chunkFiles)) {
+			for(const path of paths) {
+				try { files += FS.stat(path).size } catch(e) {}
+			}
+		}
+		const game = typeof HEAP8 !== 'undefined' ? HEAP8.length : 0
+		const js = typeof performance !== 'undefined' && performance.memory ? performance.memory.usedJSHeapSize : 0
+		console.log(`memory after ${mapName}: game ${mb(game)} MB, files ${mb(files)} MB, JS heap ${js ? mb(js) + ' MB' : 'n/a'}`)
 	}
 
 	// Unlink everything a chunk wrote. MEMFS holds file contents as JS arrays,
@@ -720,6 +789,99 @@ class DataLoader {
 }
 
 const dataLoader = new DataLoader()
+
+// Multiplayer relay. The engine's UDP sockets (net_ws.cpp) send and receive
+// through Module.csNet instead: one WebSocket to the relay, each packet carrying
+// a small address header. The relay gives this browser a virtual LAN address,
+// passes packets to other browsers and native servers, and is the master server
+// the server browser asks.
+//
+// URL: window.CS_RELAY_URL, or ?relay=, or ws://<page host>:8765/ when the page
+// is served over http. No URL means no relay: the engine uses its sockets as before.
+Module.csNet = (() => {
+	let url = (typeof window !== 'undefined' && window.CS_RELAY_URL) || ''
+	try {
+		const q = new URLSearchParams(location.search).get('relay')
+		if(q) url = q
+		if(!url && location.protocol === 'http:') url = `ws://${location.hostname}:8765/`
+	} catch(e) {}
+
+	const queues = new Map()	// local port -> [{ ip, port, data }]
+	const MAX_QUEUE = 1024
+	let ws = null
+	let open = false
+	let waiting = []
+	let vip = 0
+
+	const connect = () => {
+		try {
+			ws = new WebSocket(url, ['binary'])
+		} catch(e) {
+			console.warn('relay: bad url', url, e)
+			return
+		}
+		ws.binaryType = 'arraybuffer'
+		ws.onopen = () => {
+			open = true
+			for(const frame of waiting) ws.send(frame)
+			waiting = []
+		}
+		ws.onmessage = ev => {
+			const frame = new Uint8Array(ev.data)
+			if(frame.length < 8) return
+			const dv = new DataView(ev.data)
+			const ip = dv.getUint32(0)
+			const port = dv.getUint16(4)
+			const dstPort = dv.getUint16(6)
+			if(ip === 0 && port === 0) {
+				vip = dv.getUint32(8)
+				console.log(`relay: connected to ${url} as ${[vip >>> 24, (vip >>> 16) & 255, (vip >>> 8) & 255, vip & 255].join('.')}`)
+				return
+			}
+			let q = queues.get(dstPort)
+			if(!q) queues.set(dstPort, q = [])
+			if(q.length < MAX_QUEUE) q.push({ ip, port, data: frame.subarray(8) })
+		}
+		ws.onclose = () => {
+			if(open) console.warn('relay: disconnected, retrying')
+			open = false
+			vip = 0
+			setTimeout(connect, 3000)
+		}
+		ws.onerror = () => {}
+	}
+
+	if(url && typeof WebSocket !== 'undefined') connect()
+
+	return {
+		enabled: !!url,
+		vip: () => vip,
+		// srcPort, host-order IP, port, pointer, length
+		send(srcPort, ip, port, ptr, len) {
+			const frame = new Uint8Array(8 + len)
+			const dv = new DataView(frame.buffer)
+			dv.setUint32(0, ip >>> 0)
+			dv.setUint16(4, port)
+			dv.setUint16(6, srcPort)
+			frame.set(HEAPU8.subarray(ptr, ptr + len), 8)
+			if(open) ws.send(frame)
+			else if(waiting.length < 64) waiting.push(frame)
+			return len
+		},
+		// Returns the length, or -1 when nothing is waiting. IP and port are written
+		// through ipPtr/portPtr as int32s.
+		recv(localPort, ptr, max, ipPtr, portPtr) {
+			const q = queues.get(localPort)
+			if(!q || !q.length) return -1
+			const m = q.shift()
+			const n = Math.min(m.data.length, max)
+			HEAPU8.set(m.data.subarray(0, n), ptr)
+			HEAP32[ipPtr >> 2] = m.ip | 0
+			HEAP32[portPtr >> 2] = m.port
+			return n
+		}
+	}
+})()
 
 Module.downloadMap = (lock, mapName) => {
 	dataLoader.loadMapWithDeps(mapName).then(() => {
