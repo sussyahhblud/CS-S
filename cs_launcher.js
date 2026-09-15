@@ -32,13 +32,21 @@ if (ENVIRONMENT_IS_NODE) {
 // --pre-jses are emitted after the Module integration code, so that they can
 // refer to Module (if they choose; they can also define Module)
 // include: emscripten/pre.js
-console.log('=== BUILD 19:02:44 ===')
+console.log('=== BUILD 20:13:06 ===')
 Module['arguments'] = Module['arguments'] || []
 Module['arguments'].push(
 	'-game', 'cstrike',
 	// No -noip: it makes NET_SetMutiplayer refuse, so connect could never reach
 	// a server. Local games still use the loopback path.
 	'-language', 'english',
+	// The name from the page's Name box (shell.html). +commands run after
+	// config.cfg, so this wins over the name saved there.
+	...(() => {
+		try {
+			const name = String(localStorage.getItem('cs_player_name') || '').replace(/["';\\\r\n]/g, '').trim().slice(0, 31)
+			return name ? ['+name', name] : []
+		} catch(e) { return [] }
+	})(),
 	// The startup video owns the screen while it plays: SCR_UpdateScreen
 	// returns early every frame until it finishes, so a video that never
 	// completes is indistinguishable from a hung renderer. Off until the
@@ -292,6 +300,32 @@ Module['preRun'].push(() => {
 		)))
 		.catch(e => console.warn('server browser files failed:', e))
 		.finally(() => removeRunDependency('server_browser_files'))
+
+	// Buy menu hover panels (classes/*.res): the weapon picture and description
+	// for each button. Never traced, so never packed; shipped as assets instead.
+	addRunDependency('buy_menu_classes')
+	FS.mkdirTree('/cstrike/classes')
+	tryFetch(`${FILES_BASE}assets/classes/index.json`)
+		.then(response => response ? response.json() : [])
+		.then(names => Promise.all(names.map(name =>
+			tryFetch(`${FILES_BASE}assets/classes/${name}`)
+				.then(response => response ? response.arrayBuffer() : null)
+				.then(buffer => { if(buffer) FS.writeFile(`/cstrike/classes/${name}`, new Uint8Array(buffer)) })
+		)))
+		.catch(e => console.warn('buy menu files failed:', e))
+		.finally(() => removeRunDependency('buy_menu_classes'))
+
+	// Name prompt: with no saved name, hold the game until one is entered.
+	if(typeof document !== 'undefined' && Module.csAskName) {
+		const saved = Module.csSavedName ? Module.csSavedName() : ''
+		if(!saved) {
+			addRunDependency('player_name')
+			Module.csAskName(name => {
+				Module['arguments'].push('+name', name)
+				removeRunDependency('player_name')
+			})
+		}
+	}
 
 	addRunDependency('glbaseshaders')
 	tryFetch(`${FILES_BASE}assets/glbaseshaders.cfg`)
