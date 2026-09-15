@@ -32,7 +32,7 @@ if (ENVIRONMENT_IS_NODE) {
 // --pre-jses are emitted after the Module integration code, so that they can
 // refer to Module (if they choose; they can also define Module)
 // include: emscripten/pre.js
-console.log('=== BUILD 20:13:06 ===')
+console.log('=== BUILD 22:31:10 ===')
 Module['arguments'] = Module['arguments'] || []
 Module['arguments'].push(
 	'-game', 'cstrike',
@@ -82,7 +82,9 @@ Module['arguments'].push(
 const PERSIST_DIRS = ['/cstrike/save', '/cstrike/persistcfg']
 // Records to throw away while unpacking, because they are somebody else's
 // saved progress that was captured when the chunks were traced.
-const SKIP_UNPACK = /\/gamestate\.txt$/i
+// Player state that must never come out of a chunk: the tracer's achievements
+// and buy menu favourites would overwrite the player's own on every load.
+const SKIP_UNPACK = /\/(gamestate\.txt|buypresets_(ct|ter)\.vdf)$/i
 
 const LIVE_CONFIG = '/cstrike/cfg/config.cfg'
 const SAVED_CONFIG = '/cstrike/persistcfg/config.cfg'
@@ -136,6 +138,42 @@ Module.hl2Persist = (() => {
 
 	// The engine rewrites config.cfg in place; mirror it into the mounted dir so
 	// the sync picks it up.
+	// Buy menu favourites and custom autobuy/rebuy orders, kept like config.cfg.
+	// Written with the engine's capitalisation, read lowercased, so both spellings
+	// are watched and restored.
+	const PLAYER_CFG = ['BuyPresets_CT.vdf', 'BuyPresets_TER.vdf', 'autobuy.txt', 'rebuy.txt']
+	const capturePlayerCfg = () => {
+		for(const name of PLAYER_CFG) {
+			try {
+				const candidates = [`/cstrike/cfg/${name}`, `/cstrike/cfg/${name.toLowerCase()}`]
+				const live = candidates.filter(c => FS.analyzePath(c).exists)
+					.sort((a, b) => FS.stat(b).mtime - FS.stat(a).mtime)[0]
+				if(!live) continue
+				const saved = `/cstrike/persistcfg/${name.toLowerCase()}`
+				const data = FS.readFile(live)
+				if(FS.analyzePath(saved).exists) {
+					const old = FS.readFile(saved)
+					if(old.length === data.length && old.every((b, i) => b === data[i])) continue
+				}
+				FS.writeFile(saved, data)
+				console.log(`saved ${name} (${data.length} bytes)`)
+			} catch(e) { console.warn(`capture ${name} failed:`, e) }
+		}
+	}
+	const restorePlayerCfg = () => {
+		for(const name of PLAYER_CFG) {
+			try {
+				const saved = `/cstrike/persistcfg/${name.toLowerCase()}`
+				if(!FS.analyzePath(saved).exists) continue
+				const data = FS.readFile(saved)
+				FS.mkdirTree('/cstrike/cfg')
+				FS.writeFile(`/cstrike/cfg/${name}`, data)
+				if(name !== name.toLowerCase()) FS.writeFile(`/cstrike/cfg/${name.toLowerCase()}`, data)
+				console.log(`restored ${name} (${data.length} bytes)`)
+			} catch(e) { console.warn(`restore ${name} failed:`, e) }
+		}
+	}
+
 	const captureConfig = () => {
 		try {
 			if(!FS.analyzePath(LIVE_CONFIG).exists) return
@@ -217,6 +255,7 @@ Module.hl2Persist = (() => {
 		captureConfig()
 		captureShaderCache()
 		captureGameState()
+		capturePlayerCfg()
 		const sig = snapshot()
 		if(!force && sig === lastSig) return
 		busy = true
@@ -243,7 +282,7 @@ Module.hl2Persist = (() => {
 
 	const prime = () => { lastSig = snapshot() }
 
-	return { flush, prime, restoreConfig, restoreShaderCache, restoreGameState, snapshot, loadOk: () => loadOk, setLoadOk: v => { loadOk = v } }
+	return { flush, prime, restoreConfig, restoreShaderCache, restoreGameState, restorePlayerCfg, snapshot, loadOk: () => loadOk, setLoadOk: v => { loadOk = v } }
 })()
 
 Module['preRun'] = Module['preRun'] || []
@@ -369,6 +408,9 @@ Module['preRun'].push(() => {
 		// Safe to do before the chunks load: the packer no longer puts
 		// gamestate.txt in them, so nothing arrives later to overwrite it.
 		Module.hl2Persist.restoreGameState()
+		// Buy menu favourites and autobuy/rebuy. The chunk copy of the tracer's
+		// favourites is skipped on unpack (SKIP_UNPACK), so this one stands.
+		Module.hl2Persist.restorePlayerCfg()
 		Module.hl2Persist.prime()
 
 
